@@ -1,3 +1,10 @@
+[package]
+name = "ssc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
 [workspace]
 resolver = "2"
 members = [
