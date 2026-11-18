@@ -1,0 +1,20 @@
+[package]
+name = "ssc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSC standalone VPN CLI"
+default-run = "ssc"
+
+[[bin]]
+name = "ssc"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde_json = { workspace = true }
+ssc-api = { workspace = true }
+ssc-core = { workspace = true }
+ssc-policy = { workspace = true }
+ssc-runtime = { workspace = true }
+ssc-service = { workspace = true }

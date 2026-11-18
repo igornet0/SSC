@@ -1,0 +1,240 @@
+# SSC — cross-platform installer builds
+#
+# macOS → DMG with Install SSC.pkg + Uninstall SSC.command
+# Linux → tar.gz with install.sh
+# Windows → zip with install.ps1
+#
+# Usage:
+#   make -f Makefile.build help
+#   make -f Makefile.build installer-native
+#   make -f Makefile.build installer-macos
+#
+# Requires: rustup, cargo. macOS DMG needs pkgbuild + hdiutil.
+# For Linux/Windows from macOS: `cargo install cross` + Docker.
+
+.DEFAULT_GOAL := help
+
+PACKAGE      := ssc-cli
+BIN          := ssc
+DIST         := dist
+INSTALLERS   := $(DIST)/installers
+CARGO_FLAGS  := --release -p $(PACKAGE)
+
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+HOST_TRIPLE := $(shell rustc -vV | sed -n 's/^host: //p')
+
+TAG.aarch64-apple-darwin       := macos-arm64
+TAG.x86_64-apple-darwin        := macos-amd64
+TAG.aarch64-unknown-linux-gnu  := linux-arm64
+TAG.x86_64-unknown-linux-gnu   := linux-amd64
+TAG.aarch64-pc-windows-gnu     := windows-arm64
+TAG.x86_64-pc-windows-gnu      := windows-amd64
+
+ALL_TARGETS := \
+	aarch64-apple-darwin \
+	x86_64-apple-darwin \
+	aarch64-unknown-linux-gnu \
+	x86_64-unknown-linux-gnu \
+	aarch64-pc-windows-gnu \
+	x86_64-pc-windows-gnu
+
+.PHONY: help
+help:
+	@echo "SSC $(VERSION) — VPN installer builds"
+	@echo ""
+	@echo "  make -f Makefile.build installer-native       host ($(HOST_TRIPLE))"
+	@echo "  make -f Makefile.build installer-all          all OS × arch"
+	@echo "  make -f Makefile.build installer-macos        DMG + PKG (arm64 + amd64)"
+	@echo "  make -f Makefile.build installer-linux"
+	@echo "  make -f Makefile.build installer-windows"
+	@echo ""
+	@echo "  make -f Makefile.build installer-macos-arm64"
+	@echo "  make -f Makefile.build installer-macos-amd64"
+	@echo "  make -f Makefile.build installer-linux-arm64"
+	@echo "  make -f Makefile.build installer-linux-amd64"
+	@echo "  make -f Makefile.build installer-windows-arm64"
+	@echo "  make -f Makefile.build installer-windows-amd64"
+	@echo ""
+	@echo "  make -f Makefile.build build-native           binary only"
+	@echo "  make -f Makefile.build install-targets"
+	@echo "  make -f Makefile.build clean"
+	@echo ""
+	@echo "macOS → $(INSTALLERS)/ssc-macos-<arch>-$(VERSION).dmg  (pkg inside)"
+	@echo "Linux → $(INSTALLERS)/ssc-linux-<arch>-installer-$(VERSION).tar.gz"
+	@echo "Windows → $(INSTALLERS)/ssc-windows-<arch>-installer-$(VERSION).zip"
+
+.PHONY: install-targets
+install-targets:
+	rustup target add $(ALL_TARGETS)
+
+# ---------------------------------------------------------------------------
+# Build helpers
+# ---------------------------------------------------------------------------
+
+define build_cmd
+$(strip \
+  $(if $(filter %-apple-darwin,$(1)),cargo,\
+    $(if $(and $(filter %-unknown-linux-gnu,$(1)),$(findstring linux,$(HOST_TRIPLE))),cargo,\
+      $(if $(and $(filter %-pc-windows-%,$(1)),$(findstring windows,$(HOST_TRIPLE))),cargo,\
+        $(if $(shell command -v cross 2>/dev/null),cross,cargo)))))
+endef
+
+define bin_src
+target/$(1)/release/$(BIN)$(if $(findstring windows,$(1)),.exe,)
+endef
+
+define do_build
+	@mkdir -p $(DIST)/bin
+	@echo "==> building $(1) with $(call build_cmd,$(1))"
+	rustup target add $(1) >/dev/null
+	$(call build_cmd,$(1)) build $(CARGO_FLAGS) --target $(1)
+	cp "$(call bin_src,$(1))" "$(DIST)/bin/ssc-$(TAG.$(1))$(if $(findstring windows,$(1)),.exe,)"
+	@echo "==> $(DIST)/bin/ssc-$(TAG.$(1))$(if $(findstring windows,$(1)),.exe,)"
+endef
+
+# Linux / Windows archive installer
+# $(1) = rust triple
+define do_archive_installer
+	$(call do_build,$(1))
+	@set -e; \
+	tag="$(TAG.$(1))"; \
+	stage="$(DIST)/stage/ssc-$$tag-installer"; \
+	rm -rf "$$stage"; \
+	mkdir -p "$$stage" "$(INSTALLERS)"; \
+	if echo "$(1)" | grep -q windows; then \
+	  cp "$(DIST)/bin/ssc-$$tag.exe" "$$stage/ssc.exe"; \
+	  cp packaging/windows/install.ps1 packaging/windows/uninstall.ps1 "$$stage/"; \
+	  cp packaging/INSTALL.txt "$$stage/"; \
+	  (cd "$(DIST)/stage" && zip -qr "../installers/ssc-$$tag-installer-$(VERSION).zip" "ssc-$$tag-installer"); \
+	  echo "==> $(INSTALLERS)/ssc-$$tag-installer-$(VERSION).zip"; \
+	else \
+	  cp "$(DIST)/bin/ssc-$$tag" "$$stage/ssc"; \
+	  chmod +x "$$stage/ssc"; \
+	  cp packaging/unix/install.sh packaging/unix/uninstall.sh "$$stage/"; \
+	  cp packaging/INSTALL.txt "$$stage/"; \
+	  chmod +x "$$stage/install.sh" "$$stage/uninstall.sh"; \
+	  tar -C "$(DIST)/stage" -czf "$(INSTALLERS)/ssc-$$tag-installer-$(VERSION).tar.gz" "ssc-$$tag-installer"; \
+	  echo "==> $(INSTALLERS)/ssc-$$tag-installer-$(VERSION).tar.gz"; \
+	fi
+endef
+
+# macOS DMG with PKG + uninstall
+# $(1) = rust triple
+define do_macos_dmg
+	$(call do_build,$(1))
+	@mkdir -p $(INSTALLERS)
+	@chmod +x packaging/macos/build-dmg.sh packaging/macos/uninstall.sh packaging/macos/scripts/postinstall
+	@chmod +x "packaging/macos/Uninstall SSC.command"
+	packaging/macos/build-dmg.sh \
+		"$(DIST)/bin/ssc-$(TAG.$(1))" \
+		"$(VERSION)" \
+		"$(TAG.$(1))" \
+		"$(INSTALLERS)/ssc-$(TAG.$(1))-$(VERSION).dmg"
+endef
+
+# ---------------------------------------------------------------------------
+# Binary-only targets
+# ---------------------------------------------------------------------------
+
+.PHONY: build-macos-arm64 build-macos-amd64 build-linux-arm64 build-linux-amd64
+.PHONY: build-windows-arm64 build-windows-amd64 build-native
+build-macos-arm64:
+	$(call do_build,aarch64-apple-darwin)
+build-macos-amd64:
+	$(call do_build,x86_64-apple-darwin)
+build-linux-arm64:
+	$(call do_build,aarch64-unknown-linux-gnu)
+build-linux-amd64:
+	$(call do_build,x86_64-unknown-linux-gnu)
+build-windows-arm64:
+	$(call do_build,aarch64-pc-windows-gnu)
+build-windows-amd64:
+	$(call do_build,x86_64-pc-windows-gnu)
+
+build-native:
+	@mkdir -p $(DIST)/bin
+	@echo "==> building host $(HOST_TRIPLE)"
+	cargo build $(CARGO_FLAGS)
+	@case "$(HOST_TRIPLE)" in \
+	  aarch64-apple-darwin) tag=macos-arm64; ext="" ;; \
+	  x86_64-apple-darwin) tag=macos-amd64; ext="" ;; \
+	  aarch64-unknown-linux-*) tag=linux-arm64; ext="" ;; \
+	  x86_64-unknown-linux-*) tag=linux-amd64; ext="" ;; \
+	  aarch64-pc-windows-*) tag=windows-arm64; ext=".exe" ;; \
+	  x86_64-pc-windows-*) tag=windows-amd64; ext=".exe" ;; \
+	  *) tag="$(HOST_TRIPLE)"; ext="" ;; \
+	esac; \
+	cp "target/release/$(BIN)$$ext" "$(DIST)/bin/ssc-$$tag$$ext"; \
+	echo "==> $(DIST)/bin/ssc-$$tag$$ext"
+
+# ---------------------------------------------------------------------------
+# Installer packages
+# ---------------------------------------------------------------------------
+
+.PHONY: installer-macos-arm64 installer-macos-amd64
+installer-macos-arm64:
+	$(call do_macos_dmg,aarch64-apple-darwin)
+installer-macos-amd64:
+	$(call do_macos_dmg,x86_64-apple-darwin)
+
+.PHONY: installer-linux-arm64 installer-linux-amd64
+installer-linux-arm64:
+	$(call do_archive_installer,aarch64-unknown-linux-gnu)
+installer-linux-amd64:
+	$(call do_archive_installer,x86_64-unknown-linux-gnu)
+
+.PHONY: installer-windows-arm64 installer-windows-amd64
+installer-windows-arm64:
+	$(call do_archive_installer,aarch64-pc-windows-gnu)
+installer-windows-amd64:
+	$(call do_archive_installer,x86_64-pc-windows-gnu)
+
+.PHONY: installer-macos installer-linux installer-windows installer-all installer-native
+installer-macos: installer-macos-arm64 installer-macos-amd64
+installer-linux: installer-linux-arm64 installer-linux-amd64
+installer-windows: installer-windows-arm64 installer-windows-amd64
+installer-all: installer-macos installer-linux installer-windows
+	@echo "==> installers ready → $(INSTALLERS)/"
+	@ls -la $(INSTALLERS)/
+
+installer-native: build-native
+	@set -e; \
+	mkdir -p $(INSTALLERS); \
+	case "$(HOST_TRIPLE)" in \
+	  aarch64-apple-darwin) \
+	    chmod +x packaging/macos/build-dmg.sh packaging/macos/uninstall.sh packaging/macos/scripts/postinstall; \
+	    chmod +x "packaging/macos/Uninstall SSC.command"; \
+	    packaging/macos/build-dmg.sh \
+	      "$(DIST)/bin/ssc-macos-arm64" "$(VERSION)" "macos-arm64" \
+	      "$(INSTALLERS)/ssc-macos-arm64-$(VERSION).dmg" ;; \
+	  x86_64-apple-darwin) \
+	    chmod +x packaging/macos/build-dmg.sh packaging/macos/uninstall.sh packaging/macos/scripts/postinstall; \
+	    chmod +x "packaging/macos/Uninstall SSC.command"; \
+	    packaging/macos/build-dmg.sh \
+	      "$(DIST)/bin/ssc-macos-amd64" "$(VERSION)" "macos-amd64" \
+	      "$(INSTALLERS)/ssc-macos-amd64-$(VERSION).dmg" ;; \
+	  aarch64-unknown-linux-*|x86_64-unknown-linux-*) \
+	    tag=$$(case "$(HOST_TRIPLE)" in aarch64-*) echo linux-arm64;; *) echo linux-amd64;; esac); \
+	    stage="$(DIST)/stage/ssc-$$tag-installer"; \
+	    rm -rf "$$stage"; mkdir -p "$$stage"; \
+	    cp "$(DIST)/bin/ssc-$$tag" "$$stage/ssc"; chmod +x "$$stage/ssc"; \
+	    cp packaging/unix/install.sh packaging/unix/uninstall.sh packaging/INSTALL.txt "$$stage/"; \
+	    chmod +x "$$stage/install.sh" "$$stage/uninstall.sh"; \
+	    tar -C "$(DIST)/stage" -czf "$(INSTALLERS)/ssc-$$tag-installer-$(VERSION).tar.gz" "ssc-$$tag-installer"; \
+	    echo "==> $(INSTALLERS)/ssc-$$tag-installer-$(VERSION).tar.gz" ;; \
+	  *-pc-windows-*) \
+	    tag=$$(case "$(HOST_TRIPLE)" in aarch64-*) echo windows-arm64;; *) echo windows-amd64;; esac); \
+	    stage="$(DIST)/stage/ssc-$$tag-installer"; \
+	    rm -rf "$$stage"; mkdir -p "$$stage"; \
+	    cp "$(DIST)/bin/ssc-$$tag.exe" "$$stage/ssc.exe"; \
+	    cp packaging/windows/install.ps1 packaging/windows/uninstall.ps1 packaging/INSTALL.txt "$$stage/"; \
+	    (cd "$(DIST)/stage" && zip -qr "../installers/ssc-$$tag-installer-$(VERSION).zip" "ssc-$$tag-installer"); \
+	    echo "==> $(INSTALLERS)/ssc-$$tag-installer-$(VERSION).zip" ;; \
+	  *) echo "unsupported host $(HOST_TRIPLE)"; exit 1 ;; \
+	esac
+
+.PHONY: clean
+clean:
+	rm -rf $(DIST)
+	@echo "==> removed $(DIST)/"

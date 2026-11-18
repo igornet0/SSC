@@ -1,0 +1,43 @@
+#!/bin/bash
+# Runs as root after SSC.pkg installs /usr/local/bin/ssc.
+set -euo pipefail
+
+BIN="/usr/local/bin/ssc"
+UNINSTALL="/usr/local/bin/ssc-uninstall"
+
+chmod 755 "$BIN" 2>/dev/null || true
+if [[ -f "$UNINSTALL" ]]; then
+  chmod 755 "$UNINSTALL"
+fi
+
+# Prefer the logged-in console user so config lands in their home.
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+if [[ -z "${CONSOLE_USER:-}" || "$CONSOLE_USER" == "root" || "$CONSOLE_USER" == "_mbsetupuser" ]]; then
+  CONSOLE_USER="$(id -un 501 2>/dev/null || true)"
+fi
+
+run_setup() {
+  if [[ -n "${CONSOLE_USER:-}" && "$CONSOLE_USER" != "root" ]]; then
+    # Clear sudo-kept env that would point setup at root's home.
+    sudo -u "$CONSOLE_USER" -H "$BIN" setup || true
+  else
+    "$BIN" setup || true
+  fi
+}
+
+echo "SSC: preparing VPN runtime (sing-box)…"
+run_setup
+
+# Passwordless TUN: install /etc/sudoers.d/ssc so Connect never asks for a password.
+# Also maps ssc.lan → 127.0.0.1 in /etc/hosts for the Web UI.
+echo "SSC: installing passwordless TUN privileges…"
+if "$BIN" privileges install; then
+  echo "SSC: passwordless TUN ready (no password on Connect)"
+else
+  echo "SSC: warning — privileges install failed; run later: sudo ssc privileges install" >&2
+fi
+
+echo "SSC installed. Commands: ssc add | connect | status | disconnect"
+echo "Web UI: ssc start → http://ssc.lan:8765"
+echo "Uninstall: open Uninstall SSC.command from the DMG, or run: sudo ssc-uninstall"
+exit 0

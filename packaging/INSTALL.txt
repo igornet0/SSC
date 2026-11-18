@@ -1,0 +1,22 @@
+# SSC VPN — installer package
+
+1. Install
+   - macOS / Linux:  `./install.sh`
+     (system-wide: `./install.sh --system`)
+   - Windows:        `powershell -ExecutionPolicy Bypass -File .\install.ps1`
+
+   This copies `ssc` into PATH and downloads sing-box (VPN runtime).
+
+2. Use
+   ```
+   ssc add 'vless://…'
+   ssc connect --best
+   ssc status
+   ssc disconnect
+   ```
+
+3. Uninstall CLI
+   - Unix:    `./uninstall.sh`
+   - Windows: `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`
+
+Profiles and sing-box stay under the SSC config directory unless you delete them manually.

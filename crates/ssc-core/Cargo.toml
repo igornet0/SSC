@@ -1,0 +1,16 @@
+[package]
+name = "ssc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "URI parse, profiles, and sing-box config for SSC VPN"
+
+[dependencies]
+base64 = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ssc-policy = { workspace = true }
+thiserror = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }

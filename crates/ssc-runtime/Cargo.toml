@@ -1,0 +1,17 @@
+[package]
+name = "ssc-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sing-box install, spawn, and stop for SSC VPN"
+
+[dependencies]
+ssc-core = { workspace = true }
+ssc-policy = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

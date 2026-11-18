@@ -1,0 +1,24 @@
+[package]
+name = "ssc-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Localhost REST + WebSocket API and Web UI for SSC"
+
+[dependencies]
+axum = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ssc-core = { workspace = true }
+ssc-policy = { workspace = true }
+ssc-runtime = { workspace = true }
+ssc-service = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+http-body-util = "0.1"
+

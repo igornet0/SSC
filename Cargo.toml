@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ssc-core",
+    "crates/ssc-runtime",
+    "crates/ssc-policy",
+    "crates/ssc-service",
+    "crates/ssc-api",
+    "crates/ssc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["SSC"]
+
+[workspace.dependencies]
+ssc-core = { path = "crates/ssc-core" }
+ssc-runtime = { path = "crates/ssc-runtime" }
+ssc-policy = { path = "crates/ssc-policy" }
+ssc-service = { path = "crates/ssc-service" }
+ssc-api = { path = "crates/ssc-api" }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "set-header", "cors"] }
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
