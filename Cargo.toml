@@ -11,8 +11,10 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
+name = "ssc"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/igornet0/SSC"
 authors = ["SSC"]
 
 [workspace.dependencies]
