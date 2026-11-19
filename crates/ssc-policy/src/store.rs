@@ -38,7 +38,9 @@ pub fn policy_path() -> Result<PathBuf, PolicyStoreError> {
 /// Legacy per-profile path (read-only migration source).
 pub fn policy_path_for(profile_id: &str) -> Result<PathBuf, PolicyStoreError> {
     let id = sanitize_profile_id(profile_id)?;
-    Ok(ssc_config_dir()?.join("policies").join(format!("{id}.json")))
+    Ok(ssc_config_dir()?
+        .join("policies")
+        .join(format!("{id}.json")))
 }
 
 fn ssc_config_dir() -> Result<PathBuf, PolicyStoreError> {
@@ -54,7 +56,7 @@ fn ssc_config_dir() -> Result<PathBuf, PolicyStoreError> {
     {
         let p = dirs_fallback_macos()?;
         std::fs::create_dir_all(&p).map_err(|e| format!("create config dir: {e}"))?;
-        return Ok(p);
+        Ok(p)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -122,6 +124,22 @@ fn load_from_path(path: &Path) -> Result<PolicySnapshot, PolicyStoreError> {
     serde_json::from_str(&text).map_err(|e| format!("parse policy: {e}").into())
 }
 
+/// Load a policy snapshot from an explicit file path.
+///
+/// Used by VPN instances, each of which owns an isolated policy file.
+/// Missing files yield [`PolicySnapshot::default`].
+pub fn load_policy_at(path: &Path) -> Result<PolicySnapshot, PolicyStoreError> {
+    if !path.is_file() {
+        return Ok(PolicySnapshot::default());
+    }
+    load_from_path(path)
+}
+
+/// Persist a policy snapshot to an explicit file path (created with mode 0600).
+pub fn save_policy_at(path: &Path, snap: &PolicySnapshot) -> Result<(), PolicyStoreError> {
+    write_policy_file(path, snap)
+}
+
 fn write_policy_file(path: &Path, snap: &PolicySnapshot) -> Result<(), PolicyStoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create policy dir: {e}"))?;
@@ -157,7 +175,10 @@ fn merge_snapshots(base: &mut PolicySnapshot, other: PolicySnapshot) {
     let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for g in other.groups {
         let key = g.name.trim().to_ascii_lowercase();
-        if let Some(existing) = base.groups.iter().find(|x| x.name.trim().to_ascii_lowercase() == key)
+        if let Some(existing) = base
+            .groups
+            .iter()
+            .find(|x| x.name.trim().to_ascii_lowercase() == key)
         {
             id_map.insert(g.id.clone(), existing.id.clone());
         } else if seen_groups.insert(key) {
@@ -432,7 +453,10 @@ fn validate_rule(kind: MatchKind, value: &str) -> Result<(), PolicyStoreError> {
                 return Err("invalid domain".into());
             }
             // Allow exact, *.suffix, and .suffix forms.
-            let bare = v.strip_prefix("*.").or_else(|| v.strip_prefix('.')).unwrap_or(v);
+            let bare = v
+                .strip_prefix("*.")
+                .or_else(|| v.strip_prefix('.'))
+                .unwrap_or(v);
             if bare.is_empty() || bare.starts_with('.') || bare.contains('*') {
                 return Err("invalid domain".into());
             }
@@ -479,10 +503,7 @@ mod tests {
 
     fn with_temp_config<F: FnOnce(&std::path::Path)>(f: F) {
         let _g = LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "ssc-policy-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("ssc-policy-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("SSC_CONFIG_DIR", &dir);
@@ -535,12 +556,10 @@ mod tests {
             let per = PolicySnapshot {
                 settings: Settings::default(),
                 groups: vec![RuleGroup::new("YouTube")],
-                rules: vec![PolicyRule::new(
-                    MatchKind::Domain,
-                    "*.youtube.com",
-                    Action::Vpn,
-                )
-                .with_group("will-remap")],
+                rules: vec![
+                    PolicyRule::new(MatchKind::Domain, "*.youtube.com", Action::Vpn)
+                        .with_group("will-remap"),
+                ],
             };
             // Fix group id link
             let mut per = per;

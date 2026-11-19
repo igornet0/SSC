@@ -36,6 +36,51 @@ Secrets (share URIs, passwords, UUIDs) are **never** returned in JSON or WebSock
 | PUT | `/api/v1/profiles/:id` | Rename / activate |
 | DELETE | `/api/v1/profiles/:id` | Remove |
 | GET/POST | `/api/v1/diagnostics` | Run diagnostics |
+| GET/POST | `/api/v1/instances` | List / create independent VPN instances |
+| GET/PUT/DELETE | `/api/v1/instances/:id` | Status / patch / remove an instance |
+| POST | `/api/v1/instances/:id/start` | Start only this instance |
+| POST | `/api/v1/instances/:id/stop` | Stop only this instance |
+| POST | `/api/v1/instances/:id/restart` | Restart only this instance |
+| GET/PUT | `/api/v1/instances/:id/policy` | Isolated policy snapshot |
+| GET | `/api/v1/instances/:id/traffic` | Per-instance traffic |
+| GET | `/api/v1/instances/:id/logs?max_bytes=N` | Redacted log tail |
+
+See [vpn-instances.md](vpn-instances.md) for modes, isolation, ports and
+fail-closed behaviour.
+
+### Create an instance
+
+```json
+POST /api/v1/instances
+{
+  "id": "work",
+  "name": "Work VPN",
+  "profile_id": "p1",
+  "mode": "proxy",
+  "proxy_kind": "mixed",
+  "listen_port": 19101,
+  "fail_closed": true,
+  "auto_reconnect": true
+}
+```
+
+Response (no credentials):
+
+```json
+{
+  "id": "work",
+  "name": "Work VPN",
+  "mode": "proxy",
+  "proxy_kind": "mixed",
+  "state": "disconnected",
+  "endpoint": null,
+  "fail_closed": true,
+  "policy_mode": "selective"
+}
+```
+
+Only one `tun` instance can run at a time; starting a second returns
+`400 tun_in_use`. Any number of `proxy` instances can run concurrently.
 
 ### VPN status example
 
@@ -58,9 +103,14 @@ Server pushes JSON events (no polling required for live UI):
 
 ```json
 { "type": "vpn_status", "state": "connected", "mode": "selective", ... }
+{ "type": "vpn_instance_status", "instance": { "id": "work", "state": "connected", ... } }
+{ "type": "instances_changed" }
 { "type": "traffic", "bytes_sent": 12345, "bytes_received": 67890 }
 { "type": "connection", "domain": "google.com", "route": "vpn" }
 ```
+
+The initial `state` frame now includes an `instances` array alongside the
+compatibility `vpn` object.
 
 ## Static UI
 

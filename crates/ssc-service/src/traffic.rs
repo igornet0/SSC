@@ -88,19 +88,21 @@ impl TrafficMonitor {
         }
     }
 
-    /// Pull recent connections from sing-box Clash API (metadata only).
+    /// Pull recent connections from the default Clash API (metadata only).
     pub fn poll_clash(&self) {
-        let Some(body) = http_get("http://127.0.0.1:9090/connections") else {
+        self.poll_clash_on(ssc_core::DEFAULT_CLASH_API_PORT);
+    }
+
+    /// Pull recent connections from a specific instance Clash API port.
+    pub fn poll_clash_on(&self, port: u16) {
+        let Some(body) = http_get(&format!("http://127.0.0.1:{port}/connections")) else {
             return;
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
             return;
         };
         let up = v.get("uploadTotal").and_then(|x| x.as_u64()).unwrap_or(0);
-        let down = v
-            .get("downloadTotal")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
+        let down = v.get("downloadTotal").and_then(|x| x.as_u64()).unwrap_or(0);
         self.set_bytes(up, down);
 
         let Some(arr) = v.get("connections").and_then(|c| c.as_array()) else {
@@ -119,9 +121,11 @@ impl TrafficMonitor {
                 .and_then(|h| h.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let port = meta
-                .and_then(|m| m.get("destinationPort"))
-                .and_then(|p| p.as_str().and_then(|s| s.parse().ok()).or_else(|| p.as_u64().map(|n| n as u16)));
+            let port = meta.and_then(|m| m.get("destinationPort")).and_then(|p| {
+                p.as_str()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| p.as_u64().map(|n| n as u16))
+            });
             let protocol = meta
                 .and_then(|m| m.get("network"))
                 .and_then(|h| h.as_str())
@@ -161,10 +165,7 @@ impl TrafficMonitor {
             if skip {
                 continue;
             }
-            eprintln!(
-                "[CONNECTION_ROUTED] dest={} route={}",
-                dest, &route
-            );
+            eprintln!("[CONNECTION_ROUTED] dest={} route={}", dest, route);
             self.push(ConnectionEvent {
                 time: String::new(),
                 timestamp_ms: now_ms(),

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use ssc_policy::load_policy;
+use ssc_runtime::{InstanceMode, InstancePaths, DEFAULT_INSTANCE_ID};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
@@ -13,6 +15,18 @@ pub struct CheckResult {
     pub ok: bool,
     /// Human-readable detail / suggestion.
     pub detail: String,
+}
+
+/// Per-instance diagnostic snapshot (no credentials).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InstanceDiagnostic {
+    pub id: String,
+    pub name: String,
+    pub mode: String,
+    pub state: String,
+    pub proxy_port: Option<u16>,
+    pub clash_api_port: Option<u16>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +49,25 @@ pub struct DiagnosticsReport {
     pub last_error: Option<String>,
     pub routing_hint: String,
     pub checks: Vec<CheckResult>,
+    /// Every VPN instance (default first).
+    #[serde(default)]
+    pub instances: Vec<InstanceDiagnostic>,
+}
+
+/// Minimal registry view for naming / mode of each instance.
+#[derive(Debug, Deserialize)]
+struct RegistryFile {
+    #[serde(default)]
+    instances: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEntry {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mode: Option<ssc_runtime::InstanceMode>,
 }
 
 fn check(name: &str, label: &str, ok: bool, detail: impl Into<String>) -> CheckResult {
@@ -55,6 +88,91 @@ fn profile_server_port(profile: &ssc_core::Profile) -> Option<u16> {
         }
     }
     Some(443)
+}
+
+/// Snapshot of a single instance from its on-disk state (no credentials, sync).
+fn instance_diagnostic(id: &str, name: &str, mode: Option<InstanceMode>) -> InstanceDiagnostic {
+    let mode = mode
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "tun".into());
+    let Ok(paths) = InstancePaths::for_id(id) else {
+        return InstanceDiagnostic {
+            id: id.to_string(),
+            name: name.to_string(),
+            mode,
+            state: "unknown".to_string(),
+            ..Default::default()
+        };
+    };
+    let status = ssc_runtime::read_status_at(&paths);
+    let connected = ssc_runtime::is_instance_connected(&paths);
+    let state = if connected {
+        "connected"
+    } else if status.last_error.is_some() {
+        "error"
+    } else {
+        "disconnected"
+    };
+    InstanceDiagnostic {
+        id: id.to_string(),
+        name: name.to_string(),
+        mode,
+        state: state.to_string(),
+        proxy_port: status.proxy_port,
+        clash_api_port: status.clash_api_port,
+        last_error: status.last_error,
+    }
+}
+
+/// Every known instance: the reserved `default` first, then registry/dir ids.
+fn collect_instances() -> Vec<InstanceDiagnostic> {
+    let mut meta: BTreeMap<String, (String, Option<InstanceMode>)> = BTreeMap::new();
+    if let Ok(path) = ssc_core::instances_registry_path() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(file) = serde_json::from_str::<RegistryFile>(&text) {
+                for entry in file.instances {
+                    if ssc_core::validate_instance_id(&entry.id).is_err() {
+                        continue;
+                    }
+                    let name = if entry.name.trim().is_empty() {
+                        entry.id.clone()
+                    } else {
+                        entry.name
+                    };
+                    meta.insert(entry.id, (name, entry.mode));
+                }
+            }
+        }
+    }
+    if let Ok(dir) = ssc_core::instances_dir() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                if let Some(id) = entry.file_name().to_str() {
+                    if ssc_core::validate_instance_id(id).is_ok() {
+                        meta.entry(id.to_string())
+                            .or_insert_with(|| (id.to_string(), None));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(meta.len() + 1);
+    out.push(instance_diagnostic(
+        DEFAULT_INSTANCE_ID,
+        "Default VPN",
+        Some(InstanceMode::Tun),
+    ));
+    for (id, (name, mode)) in meta {
+        if id == DEFAULT_INSTANCE_ID {
+            continue;
+        }
+        out.push(instance_diagnostic(&id, &name, mode));
+    }
+    out
 }
 
 pub fn run_diagnostics() -> DiagnosticsReport {
@@ -88,12 +206,7 @@ pub fn run_diagnostics() -> DiagnosticsReport {
     ));
 
     match crate::netconflict::foreign_vpn_conflict() {
-        Some(msg) => checks.push(check(
-            "foreign_vpn",
-            "Other VPN conflict",
-            false,
-            msg,
-        )),
+        Some(msg) => checks.push(check("foreign_vpn", "Other VPN conflict", false, msg)),
         None => checks.push(check(
             "foreign_vpn",
             "Other VPN conflict",
@@ -107,16 +220,13 @@ pub fn run_diagnostics() -> DiagnosticsReport {
         "tunnel_interface",
         "Tunnel interface",
         iface_ok,
-        status
-            .interface
-            .clone()
-            .unwrap_or_else(|| {
-                if connected {
-                    "Connected but utun not detected yet".into()
-                } else {
-                    "No tunnel (disconnected)".into()
-                }
-            }),
+        status.interface.clone().unwrap_or_else(|| {
+            if connected {
+                "Connected but utun not detected yet".into()
+            } else {
+                "No tunnel (disconnected)".into()
+            }
+        }),
     ));
 
     let server_check = match (&status.server, ssc_core::active_profile()) {
@@ -129,11 +239,8 @@ pub fn run_diagnostics() -> DiagnosticsReport {
                 .ok()
                 .and_then(|mut i| i.next())
                 .map(|sa| {
-                    std::net::TcpStream::connect_timeout(
-                        &sa,
-                        std::time::Duration::from_secs(2),
-                    )
-                    .is_ok()
+                    std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2))
+                        .is_ok()
                 })
                 .unwrap_or(false);
             check(
@@ -285,6 +392,7 @@ pub fn run_diagnostics() -> DiagnosticsReport {
             "Routes are managed by sing-box auto_route. Inspect with `route -n get default` or `ssc` route probe."
                 .into(),
         checks,
+        instances: collect_instances(),
     }
 }
 
@@ -311,6 +419,23 @@ pub fn format_diagnostics_pretty(report: &DiagnosticsReport) -> String {
         lines.push(format!("  Last error: {err}"));
     }
     lines.push(format!("  Hint:     {}", report.routing_hint));
+    lines.push(String::new());
+    lines.push("Instances:".into());
+    if report.instances.is_empty() {
+        lines.push("  (none)".into());
+    } else {
+        for inst in &report.instances {
+            let port = inst
+                .proxy_port
+                .map(|p| format!(" :{p}"))
+                .unwrap_or_default();
+            let mut line = format!("  {} [{}] {}{}", inst.id, inst.mode, inst.state, port);
+            if let Some(err) = &inst.last_error {
+                line.push_str(&format!(" — {err}"));
+            }
+            lines.push(line);
+        }
+    }
     lines.push(String::new());
     lines.push("Checks:".into());
     for c in &report.checks {

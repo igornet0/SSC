@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::Command;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
     /// Destination directory for the `ssc` binary. `None` → platform default.
     pub prefix_bin: Option<PathBuf>,
@@ -15,16 +15,6 @@ pub struct InstallOptions {
     pub skip_setup: bool,
     /// Prefer system-wide install (`/usr/local/bin`) when possible.
     pub system: bool,
-}
-
-impl Default for InstallOptions {
-    fn default() -> Self {
-        Self {
-            prefix_bin: None,
-            skip_setup: false,
-            system: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,8 +44,8 @@ pub fn default_bin_dir(system: bool) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
         let _ = system;
-        let base = dirs::data_local_dir()
-            .ok_or_else(|| "cannot resolve LocalAppData".to_string())?;
+        let base =
+            dirs::data_local_dir().ok_or_else(|| "cannot resolve LocalAppData".to_string())?;
         return Ok(base.join("Programs").join("ssc"));
     }
 
@@ -170,11 +160,7 @@ pub fn install(opts: InstallOptions) -> Result<InstallResult, String> {
         None => default_bin_dir(opts.system)?,
     };
     let dest = bin_dir.join(binary_name());
-    eprintln!(
-        "Installing SSC ({}) → {}",
-        platform_name(),
-        dest.display()
-    );
+    eprintln!("Installing SSC ({}) → {}", platform_name(), dest.display());
     copy_self_to(&dest)?;
 
     #[cfg(target_os = "windows")]

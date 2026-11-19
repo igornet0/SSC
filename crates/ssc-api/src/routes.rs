@@ -13,7 +13,10 @@ use ssc_policy::{
     load_policy, save_policy, update_group, update_rule, Action, GroupPatch, MatchKind, PolicyMode,
     RulePatch, Settings,
 };
-use ssc_service::{probe_destination, run_diagnostics};
+use ssc_service::{
+    probe_destination, run_diagnostics, CreateInstanceRequest, InstanceMode, UpdateInstanceRequest,
+    DEFAULT_INSTANCE_ID,
+};
 use std::sync::Arc;
 
 pub fn api_routes() -> Router<Arc<AppState>> {
@@ -27,26 +30,40 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/policy/export", get(policy_export))
         .route("/api/v1/policy/import", post(policy_import))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
-        .route(
-            "/api/v1/rules/{id}",
-            put(patch_rule).delete(remove_rule),
-        )
+        .route("/api/v1/rules/{id}", put(patch_rule).delete(remove_rule))
         .route("/api/v1/groups", get(list_groups).post(create_group))
-        .route(
-            "/api/v1/groups/{id}",
-            put(patch_group).delete(remove_group),
-        )
+        .route("/api/v1/groups/{id}", put(patch_group).delete(remove_group))
         .route("/api/v1/traffic", get(get_traffic))
-        .route(
-            "/api/v1/profiles",
-            get(list_profiles).post(create_profile),
-        )
+        .route("/api/v1/profiles", get(list_profiles).post(create_profile))
         .route(
             "/api/v1/profiles/{id}",
             put(update_profile).delete(remove_profile),
         )
         .route("/api/v1/diagnostics", get(diagnostics).post(diagnostics))
-        .route("/api/v1/route/probe", get(route_probe).post(route_probe_post))
+        .route(
+            "/api/v1/route/probe",
+            get(route_probe).post(route_probe_post),
+        )
+        // Independent VPN instances (TUN or Local Proxy).
+        .route(
+            "/api/v1/instances",
+            get(list_instances).post(create_instance),
+        )
+        .route(
+            "/api/v1/instances/{id}",
+            get(get_instance)
+                .put(update_instance)
+                .delete(remove_instance),
+        )
+        .route("/api/v1/instances/{id}/start", post(start_instance))
+        .route("/api/v1/instances/{id}/stop", post(stop_instance))
+        .route("/api/v1/instances/{id}/restart", post(restart_instance))
+        .route(
+            "/api/v1/instances/{id}/policy",
+            get(get_instance_policy).put(put_instance_policy),
+        )
+        .route("/api/v1/instances/{id}/traffic", get(instance_traffic))
+        .route("/api/v1/instances/{id}/logs", get(instance_logs))
 }
 
 fn localhost_only(headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
@@ -78,7 +95,10 @@ fn is_local_origin(origin: &str) -> bool {
 
 fn friendly_err(e: String) -> (StatusCode, Json<Value>) {
     let lower = e.to_lowercase();
-    let reason = if lower.contains("another vpn") || lower.contains("foreign vpn") || lower.contains("owns the default route") {
+    let reason = if lower.contains("another vpn")
+        || lower.contains("foreign vpn")
+        || lower.contains("owns the default route")
+    {
         "Another VPN is connected (e.g. Happ) — turn it off, then Connect"
     } else if lower.contains("timed out") || lower.contains("timeout") {
         "Unable to reach VPN server (timeout)"
@@ -86,7 +106,11 @@ fn friendly_err(e: String) -> (StatusCode, Json<Value>) {
         "Unable to reach VPN server"
     } else if lower.contains("no active profile") || lower.contains("no secret") {
         "No VPN profile configured — import a share URI first"
-    } else if lower.contains("sudo") || lower.contains("elevat") || lower.contains("permission") || lower.contains("administrator") {
+    } else if lower.contains("sudo")
+        || lower.contains("elevat")
+        || lower.contains("permission")
+        || lower.contains("administrator")
+    {
         "Elevated privileges required for TUN — approve the macOS password prompt"
     } else if lower.contains("sing-box check") {
         "VPN configuration invalid — run Diagnostics"
@@ -109,19 +133,31 @@ fn err_map(e: String) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": e })))
 }
 
+/// Recompile the global policy into the default instance only.
+async fn apply_default_policy(state: &AppState) {
+    if let Err(e) = state.instances.apply_policy(DEFAULT_INSTANCE_ID).await {
+        eprintln!("[POLICY_APPLY_FAILED] instance={DEFAULT_INSTANCE_ID}: {e}");
+    }
+}
+
 async fn aggregate_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let vpn = state.vpn.status();
+    let vpn = state.vpn_status().await.ok();
+    let instances = state.instances.list().await.unwrap_or_default();
     let policy = load_policy().unwrap_or_default();
     Json(json!({
         "vpn": vpn,
+        "instances": instances,
         "mode": policy.settings.mode.as_str(),
         "rules_count": policy.active_rules().count(),
         "kill_switch": policy.settings.kill_switch,
     }))
 }
 
-async fn vpn_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.vpn.status())
+async fn vpn_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let status = state.vpn_status().await.map_err(err_map)?;
+    Ok(Json(status))
 }
 
 async fn vpn_connect(
@@ -129,21 +165,26 @@ async fn vpn_connect(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     localhost_only(&headers)?;
-    let vpn = state.vpn;
-    let result = tokio::task::spawn_blocking(move || vpn.connect())
+    let profile = ssc_core::active_profile().map_err(err_map)?;
+    state
+        .instances
+        .configure_default(Some(profile.id), Some(InstanceMode::Tun), None, None)
         .await
-        .map_err(|e| err_map(format!("connect task: {e}")))?;
-    match result {
-        Ok(status) => {
-            state.broadcast_status(&status);
+        .map_err(err_map)?;
+    match state.instances.start(DEFAULT_INSTANCE_ID).await {
+        Ok(instance) => {
+            state.broadcast_instance_status(&instance);
+            let status = state.vpn_status().await.map_err(err_map)?;
             Ok(Json(status))
         }
         Err(e) => {
-            // Race: HTTP timed out / already-connected while tunnel is actually up.
-            if ssc_runtime::is_connected() {
-                let status = state.vpn.status();
-                state.broadcast_status(&status);
-                return Ok(Json(status));
+            // Race: the tunnel may already be up even if the request failed.
+            if let Ok(instance) = state.instances.status(DEFAULT_INSTANCE_ID).await {
+                if instance.state == ssc_service::VpnState::Connected {
+                    state.broadcast_instance_status(&instance);
+                    let status = state.vpn_status().await.map_err(err_map)?;
+                    return Ok(Json(status));
+                }
             }
             state.broadcast_error(&e);
             Err(friendly_err(e))
@@ -156,12 +197,13 @@ async fn vpn_disconnect(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     localhost_only(&headers)?;
-    let vpn = state.vpn;
-    let status = tokio::task::spawn_blocking(move || vpn.disconnect())
+    let instance = state
+        .instances
+        .stop(DEFAULT_INSTANCE_ID)
         .await
-        .map_err(|e| err_map(format!("disconnect task: {e}")))?
         .map_err(err_map)?;
-    state.broadcast_status(&status);
+    state.broadcast_instance_status(&instance);
+    let status = state.vpn_status().await.map_err(err_map)?;
     Ok(Json(status))
 }
 
@@ -170,20 +212,25 @@ async fn vpn_reconnect(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     localhost_only(&headers)?;
-    let vpn = state.vpn;
-    let result = tokio::task::spawn_blocking(move || vpn.reconnect())
+    let profile = ssc_core::active_profile().map_err(err_map)?;
+    state
+        .instances
+        .configure_default(Some(profile.id), Some(InstanceMode::Tun), None, None)
         .await
-        .map_err(|e| err_map(format!("reconnect task: {e}")))?;
-    match result {
-        Ok(status) => {
-            state.broadcast_status(&status);
+        .map_err(err_map)?;
+    match state.instances.restart(DEFAULT_INSTANCE_ID).await {
+        Ok(instance) => {
+            state.broadcast_instance_status(&instance);
+            let status = state.vpn_status().await.map_err(err_map)?;
             Ok(Json(status))
         }
         Err(e) => {
-            if ssc_runtime::is_connected() {
-                let status = state.vpn.status();
-                state.broadcast_status(&status);
-                return Ok(Json(status));
+            if let Ok(instance) = state.instances.status(DEFAULT_INSTANCE_ID).await {
+                if instance.state == ssc_service::VpnState::Connected {
+                    state.broadcast_instance_status(&instance);
+                    let status = state.vpn_status().await.map_err(err_map)?;
+                    return Ok(Json(status));
+                }
             }
             state.broadcast_error(&e);
             Err(friendly_err(e))
@@ -235,7 +282,7 @@ async fn put_policy(
     save_policy(&snap).map_err(|e| err_map(e.to_string()))?;
     let port = snap.settings.api_port;
     let _ = ssc_service::launch_agent_sync(snap.settings.launch_at_login, port);
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok(Json(json!({ "applied": true, "policy": snap })))
 }
@@ -273,7 +320,7 @@ async fn create_group(
         )
         .map_err(|e| err_map(e.to_string()))?;
     }
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok((
         StatusCode::CREATED,
@@ -302,7 +349,7 @@ async fn patch_group(
         },
     )
     .map_err(|e| err_map(e.to_string()))?;
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok(Json(json!({ "applied": true, "group": g })))
 }
@@ -322,7 +369,7 @@ async fn remove_group(
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     localhost_only(&headers)?;
     delete_group(&id, q.delete_rules).map_err(|e| err_map(e.to_string()))?;
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok(Json(json!({ "ok": true, "applied": true })))
 }
@@ -365,7 +412,7 @@ async fn create_rule(
         rule.action.as_str(),
         rule.group_id.as_deref().unwrap_or("-")
     );
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok((
         StatusCode::CREATED,
@@ -397,7 +444,7 @@ async fn patch_rule(
         group_id: body.group_id,
     };
     let rule = update_rule(&id, patch).map_err(|e| err_map(e.to_string()))?;
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok(Json(json!({ "applied": true, "rule": rule })))
 }
@@ -410,7 +457,7 @@ async fn remove_rule(
     localhost_only(&headers)?;
     delete_rule(&id).map_err(|e| err_map(e.to_string()))?;
     eprintln!("[RULE_REMOVED] {id}");
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok(Json(json!({ "ok": true, "applied": true })))
 }
@@ -496,15 +543,26 @@ async fn update_profile(
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     localhost_only(&headers)?;
     if body.active == Some(true) {
-        // Switch profile: disconnect → activate → connect with that profile's policy.
-        if ssc_runtime::is_connected() {
-            let _ = state.vpn.disconnect();
+        // Switch profile: disconnect → activate → connect with that profile.
+        if let Ok(current) = state.instances.status(DEFAULT_INSTANCE_ID).await {
+            if current.state == ssc_service::VpnState::Connected {
+                let _ = state.instances.stop(DEFAULT_INSTANCE_ID).await;
+            }
         }
         let p = ssc_core::set_active(&id).map_err(err_map)?;
-        match state.vpn.connect() {
-            Ok(status) => {
-                state.broadcast_status(&status);
+        if let Err(e) = state
+            .instances
+            .configure_default(Some(p.id.clone()), Some(InstanceMode::Tun), None, None)
+            .await
+        {
+            state.broadcast_error(&e);
+            return Err(friendly_err(e));
+        }
+        match state.instances.start(DEFAULT_INSTANCE_ID).await {
+            Ok(instance) => {
+                state.broadcast_instance_status(&instance);
                 state.broadcast_policy_changed();
+                let status = state.vpn_status().await.map_err(err_map)?;
                 return Ok(Json(json!({
                     "id": p.id,
                     "name": p.name,
@@ -557,7 +615,9 @@ async fn diagnostics() -> Response {
 
 async fn policy_export() -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     let json = export_policy().map_err(|e| err_map(e.to_string()))?;
-    Ok(Json(json!({ "policy": serde_json::from_str::<Value>(&json).unwrap_or(Value::Null), "raw": json })))
+    Ok(Json(
+        json!({ "policy": serde_json::from_str::<Value>(&json).unwrap_or(Value::Null), "raw": json }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,7 +644,7 @@ async fn policy_import(
         return Err(err_map("provide policy or raw".into()));
     };
     let snap = import_policy(&text).map_err(|e| err_map(e.to_string()))?;
-    let _ = state.vpn.apply_policy();
+    apply_default_policy(&state).await;
     state.broadcast_policy_changed();
     Ok(Json(json!({ "applied": true, "policy": snap })))
 }
@@ -607,6 +667,184 @@ struct ProbeBody {
 
 async fn route_probe_post(Json(body): Json<ProbeBody>) -> impl IntoResponse {
     Json(probe_destination(&body.dest))
+}
+
+// ---------------------------------------------------------------------------
+// Independent VPN instances
+// ---------------------------------------------------------------------------
+
+fn instance_err(e: String) -> (StatusCode, Json<Value>) {
+    let lower = e.to_lowercase();
+    let code = if lower.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if lower.contains("already exists") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (code, Json(json!({ "error": e })))
+}
+
+async fn list_instances(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let instances = state.instances.list().await.map_err(instance_err)?;
+    Ok(Json(json!({ "instances": instances })))
+}
+
+async fn create_instance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateInstanceRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    let view = state.instances.create(body).await.map_err(instance_err)?;
+    state.broadcast_instance_status(&view);
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+async fn get_instance(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let view = state.instances.status(&id).await.map_err(instance_err)?;
+    Ok(Json(view))
+}
+
+async fn update_instance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateInstanceRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    let view = state
+        .instances
+        .update(&id, body)
+        .await
+        .map_err(instance_err)?;
+    state.broadcast_instance_status(&view);
+    Ok(Json(view))
+}
+
+async fn remove_instance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    state.instances.remove(&id).await.map_err(instance_err)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn start_instance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    match state.instances.start(&id).await {
+        Ok(view) => {
+            state.broadcast_instance_status(&view);
+            Ok(Json(view))
+        }
+        Err(e) => {
+            state.broadcast_error(&e);
+            Err(instance_err(e))
+        }
+    }
+}
+
+async fn stop_instance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    let view = state.instances.stop(&id).await.map_err(instance_err)?;
+    state.broadcast_instance_status(&view);
+    Ok(Json(view))
+}
+
+async fn restart_instance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    match state.instances.restart(&id).await {
+        Ok(view) => {
+            state.broadcast_instance_status(&view);
+            Ok(Json(view))
+        }
+        Err(e) => {
+            state.broadcast_error(&e);
+            Err(instance_err(e))
+        }
+    }
+}
+
+async fn get_instance_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let policy = state.instances.policy(&id).await.map_err(instance_err)?;
+    Ok(Json(policy))
+}
+
+async fn put_instance_policy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(policy): Json<ssc_policy::PolicySnapshot>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    localhost_only(&headers)?;
+    let view = state
+        .instances
+        .set_policy(&id, &policy)
+        .await
+        .map_err(instance_err)?;
+    state.broadcast_instance_status(&view);
+    state.broadcast_policy_changed();
+    Ok(Json(
+        json!({ "applied": true, "instance": view, "policy": policy }),
+    ))
+}
+
+async fn instance_traffic(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let snapshot = state
+        .instances
+        .poll_traffic(&id)
+        .await
+        .map_err(instance_err)?;
+    Ok(Json(snapshot))
+}
+
+#[derive(Debug, Deserialize)]
+struct LogQuery {
+    #[serde(default = "default_log_bytes")]
+    max_bytes: usize,
+}
+
+fn default_log_bytes() -> usize {
+    64 * 1024
+}
+
+async fn instance_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LogQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let max = q.max_bytes.clamp(1, 1024 * 1024);
+    let text = state
+        .instances
+        .log_tail(&id, max)
+        .await
+        .map_err(instance_err)?;
+    Ok(Json(json!({ "id": id, "log": text })))
 }
 
 #[cfg(test)]

@@ -45,16 +45,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.events.subscribe();
 
     // Full initial state so UI does not depend on prior event order.
-    let init = state.initial_state_json();
+    let init = state.initial_state_json().await;
     let _ = sender.send(Message::Text(init.into())).await;
 
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
-            if sender
-                .send(Message::Text(msg.into()))
-                .await
-                .is_err()
-            {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }

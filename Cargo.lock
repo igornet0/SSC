@@ -1247,8 +1247,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssc"
+version = "0.1.0"
+dependencies = [
+ "ssc-api",
+ "ssc-core",
+ "ssc-policy",
+ "ssc-runtime",
+ "ssc-service",
+]
+
+[[package]]
 name = "ssc-api"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -1266,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "ssc-cli"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -1279,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "ssc-core"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "base64",
  "dirs",
@@ -1293,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "ssc-policy"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "ipnet",
  "serde",
@@ -1304,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "ssc-runtime"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "libc",
@@ -1317,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "ssc-service"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1328,6 +1339,8 @@ dependencies = [
  "ssc-policy",
  "ssc-runtime",
  "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -1505,6 +1518,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

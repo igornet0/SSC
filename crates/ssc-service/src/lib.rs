@@ -2,6 +2,7 @@
 
 mod cmdutil;
 mod diagnostics;
+mod instance_manager;
 mod kill_switch;
 mod launch_agent;
 mod netconflict;
@@ -14,7 +15,14 @@ pub use cmdutil::{
     http_get_timed, http_put_timed, run_timed, run_timed_ok, DEFAULT_CMD_TIMEOUT,
     DEFAULT_HTTP_TIMEOUT,
 };
-pub use diagnostics::{format_diagnostics_pretty, run_diagnostics, CheckResult, DiagnosticsReport};
+pub use diagnostics::{
+    format_diagnostics_pretty, run_diagnostics, CheckResult, DiagnosticsReport, InstanceDiagnostic,
+};
+pub use instance_manager::{
+    poll_traffic_loop, reconnect_backoff, CreateInstanceRequest, InstanceConfig, InstanceEvent,
+    InstanceStatusView, ProfileResolver, ResolvedProfile, StoreProfileResolver,
+    UpdateInstanceRequest, VpnInstanceManager, VpnState,
+};
 pub use kill_switch::{
     activate as kill_switch_activate, activate_for_policy, deactivate as kill_switch_deactivate,
     vpn_dest_cidrs,
@@ -29,12 +37,21 @@ pub use reconcile::{
     ReconcileReport,
 };
 pub use route_probe::{probe_destination, MatchedRuleView, RouteProbeResult};
+pub use ssc_runtime::{InstanceMode, DEFAULT_INSTANCE_ID};
 pub use traffic::{ConnectionEvent, TrafficMonitor, TrafficSnapshot};
-pub use vpn_manager::{reset_network, VpnManager, VpnState, VpnStatusView};
+pub use vpn_manager::{reset_network, run_blocking, VpnManager, VpnStatusView};
 
-/// Serialize tests that mutate `SSC_CONFIG_DIR` (parallel cargo tests race otherwise).
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serialize synchronous tests that mutate `SSC_CONFIG_DIR`.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.blocking_lock()
+}
+
+/// Async-aware variant: never held across an `.await` in a way clippy flags.
+#[cfg(test)]
+pub(crate) async fn test_env_lock_async() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.lock().await
 }

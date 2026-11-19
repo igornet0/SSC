@@ -56,17 +56,22 @@ pub async fn serve(port: u16) -> Result<(), String> {
     }
 
     let state = Arc::new(AppState::new());
+    state.spawn_event_forwarder();
+
     let poll_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             tick.tick().await;
-            poll_state.traffic.poll_clash();
-            let snap = poll_state.vpn.status();
-            poll_state
-                .traffic
-                .set_bytes(snap.bytes_sent, snap.bytes_received);
-            poll_state.broadcast_status(&snap);
+            let _ = poll_state.instances.poll_all_traffic().await;
+            if let Ok(views) = poll_state.instances.list().await {
+                let sent = views.iter().map(|v| v.bytes_sent).sum();
+                let received = views.iter().map(|v| v.bytes_received).sum();
+                poll_state.traffic.set_bytes(sent, received);
+                for view in views {
+                    poll_state.broadcast_instance_status(&view);
+                }
+            }
         }
     });
 
@@ -78,10 +83,25 @@ pub async fn serve(port: u16) -> Result<(), String> {
         }
         let _ = ssc_service::launch_agent_sync(policy.settings.launch_at_login, port);
         if policy.settings.connect_automatically {
-            let vpn = state.vpn;
-            tokio::task::spawn_blocking(move || match vpn.connect() {
-                Ok(s) => eprintln!("[AUTO_CONNECT] state={}", s.state.as_str()),
-                Err(e) => eprintln!("[AUTO_CONNECT] failed: {e}"),
+            let instances = state.instances.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let profile = ssc_core::active_profile()?;
+                    instances
+                        .configure_default(
+                            Some(profile.id),
+                            Some(ssc_service::InstanceMode::Tun),
+                            None,
+                            None,
+                        )
+                        .await?;
+                    instances.start(ssc_service::DEFAULT_INSTANCE_ID).await
+                }
+                .await;
+                match result {
+                    Ok(s) => eprintln!("[AUTO_CONNECT] state={}", s.state.as_str()),
+                    Err(e) => eprintln!("[AUTO_CONNECT] failed: {e}"),
+                }
             });
         }
     }

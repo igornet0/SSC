@@ -18,7 +18,6 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-name = "ssc"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/igornet0/SSC"
@@ -47,7 +46,8 @@ thiserror = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal", "process", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "set-header", "cors"] }
 futures-util = "0.3"

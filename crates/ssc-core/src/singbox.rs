@@ -2,8 +2,133 @@
 
 use crate::config_paths::singbox_run_path;
 use crate::uri::{parse_share_uri, ParsedShare, Protocol};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ssc_policy::{compile_route_rules, PolicySnapshot};
+
+/// Default clash/admin API port used by the legacy single-instance mode.
+pub const DEFAULT_CLASH_API_PORT: u16 = 9090;
+
+/// Default TUN address used by SSC's system VPN mode.
+pub const DEFAULT_TUN_ADDRESS: &str = "172.19.0.1/30";
+
+/// Inbound used by a sing-box instance.
+///
+/// `Tun` is the system VPN mode (requires elevation). `Mixed`, `Http` and
+/// `Socks` are local proxy modes bound to loopback and require no privileges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InboundKind {
+    Tun,
+    Mixed,
+    Http,
+    Socks,
+}
+
+impl InboundKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboundKind::Tun => "tun",
+            InboundKind::Mixed => "mixed",
+            InboundKind::Http => "http",
+            InboundKind::Socks => "socks",
+        }
+    }
+
+    pub fn is_proxy(self) -> bool {
+        !matches!(self, InboundKind::Tun)
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tun" | "system" | "system-vpn" => Some(InboundKind::Tun),
+            "mixed" | "proxy" => Some(InboundKind::Mixed),
+            "http" | "https" => Some(InboundKind::Http),
+            "socks" | "socks5" => Some(InboundKind::Socks),
+            _ => None,
+        }
+    }
+}
+
+/// Per-instance sing-box options (inbound mode, ports, TUN addressing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingboxOptions {
+    pub inbound: InboundKind,
+    /// Loopback host for proxy inbounds. Ignored for TUN.
+    pub listen_host: String,
+    /// Local proxy port. Required for proxy inbounds.
+    pub listen_port: Option<u16>,
+    /// Unique Clash/admin API port for this instance.
+    pub clash_api_port: u16,
+    /// TUN interface address. Only used for [`InboundKind::Tun`].
+    pub tun_address: String,
+}
+
+impl Default for SingboxOptions {
+    fn default() -> Self {
+        Self {
+            inbound: InboundKind::Tun,
+            listen_host: "127.0.0.1".into(),
+            listen_port: None,
+            clash_api_port: DEFAULT_CLASH_API_PORT,
+            tun_address: DEFAULT_TUN_ADDRESS.into(),
+        }
+    }
+}
+
+impl SingboxOptions {
+    pub fn tun() -> Self {
+        Self::default()
+    }
+
+    pub fn proxy(kind: InboundKind, port: u16, clash_api_port: u16) -> Self {
+        Self {
+            inbound: if kind == InboundKind::Tun {
+                InboundKind::Mixed
+            } else {
+                kind
+            },
+            listen_host: "127.0.0.1".into(),
+            listen_port: Some(port),
+            clash_api_port,
+            tun_address: DEFAULT_TUN_ADDRESS.into(),
+        }
+    }
+
+    pub fn with_clash_api_port(mut self, port: u16) -> Self {
+        self.clash_api_port = port;
+        self
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.clash_api_port == 0 {
+            return Err("clash api port must be non-zero".into());
+        }
+        if self.inbound.is_proxy() {
+            let port = self
+                .listen_port
+                .ok_or_else(|| "proxy inbound requires a listen port".to_string())?;
+            if port == 0 {
+                return Err("proxy listen port must be non-zero".into());
+            }
+            if self.clash_api_port == port {
+                return Err("clash api port must differ from proxy listen port".into());
+            }
+            if !is_loopback_host(&self.listen_host) {
+                return Err(format!(
+                    "local proxy must bind loopback, refusing host {}",
+                    self.listen_host
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim();
+    h == "127.0.0.1" || h == "::1" || h.eq_ignore_ascii_case("localhost")
+}
 
 fn tls_object(parsed: &ParsedShare) -> Option<Value> {
     if !parsed.tls.enabled && !parsed.reality.enabled {
@@ -155,6 +280,19 @@ pub fn build_singbox_config_from_parsed(
     parsed: &ParsedShare,
     policy: &PolicySnapshot,
 ) -> Result<Value, String> {
+    build_singbox_config_with_options(parsed, policy, &SingboxOptions::default())
+}
+
+/// Build a sing-box config for an explicit inbound mode / port set.
+///
+/// TUN mode creates a system tunnel; proxy modes create a loopback
+/// HTTP/SOCKS/mixed inbound and never require root.
+pub fn build_singbox_config_with_options(
+    parsed: &ParsedShare,
+    policy: &PolicySnapshot,
+    options: &SingboxOptions,
+) -> Result<Value, String> {
+    options.validate()?;
     let proxy = build_proxy_outbound(parsed)?;
     let compiled = compile_route_rules(policy);
 
@@ -182,6 +320,31 @@ pub fn build_singbox_config_from_parsed(
     let outbounds = vec![proxy, json!({ "type": "direct", "tag": "direct" })];
     let _ = compiled.need_block_outbound; // reserved for kill-switch helpers
 
+    let inbounds = match options.inbound {
+        InboundKind::Tun => vec![json!({
+            "type": "tun",
+            "tag": "tun-in",
+            "address": [options.tun_address.clone()],
+            "mtu": 1500,
+            "auto_route": true,
+            "strict_route": true,
+            "stack": "system",
+            // Keep loopback/LAN off the TUN stack entirely (not just DIRECT outbound).
+            "route_exclude_address": exclusions
+        })],
+        InboundKind::Mixed | InboundKind::Http | InboundKind::Socks => {
+            let port = options
+                .listen_port
+                .ok_or_else(|| "proxy inbound requires a listen port".to_string())?;
+            vec![json!({
+                "type": options.inbound.as_str(),
+                "tag": format!("{}-in", options.inbound.as_str()),
+                "listen": options.listen_host,
+                "listen_port": port,
+            })]
+        }
+    };
+
     Ok(json!({
         "log": { "level": "warn", "timestamp": true },
         "dns": {
@@ -193,19 +356,7 @@ pub fn build_singbox_config_from_parsed(
             // Avoid half-broken AAAA paths when TUN is IPv4-only (Electron/Cursor).
             "strategy": "ipv4_only"
         },
-        "inbounds": [
-            {
-                "type": "tun",
-                "tag": "tun-in",
-                "address": ["172.19.0.1/30"],
-                "mtu": 1500,
-                "auto_route": true,
-                "strict_route": true,
-                "stack": "system",
-                // Keep loopback/LAN off the TUN stack entirely (not just DIRECT outbound).
-                "route_exclude_address": exclusions
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
             "auto_detect_interface": true,
@@ -215,7 +366,7 @@ pub fn build_singbox_config_from_parsed(
         },
         "experimental": {
             "clash_api": {
-                "external_controller": "127.0.0.1:9090",
+                "external_controller": format!("127.0.0.1:{}", options.clash_api_port),
                 "secret": ""
             }
         }
@@ -256,6 +407,65 @@ pub fn write_singbox_config(uri: &str) -> Result<std::path::PathBuf, String> {
     })
 }
 
+/// Write sing-box config to a caller-provided path with mode 0600.
+///
+/// Used by independent VPN instances. Each instance owns an isolated config
+/// directory; credentials never leave that directory while connected.
+/// When `meta_path` is given, a redacted (********) diagnostic copy is written.
+pub fn write_singbox_config_at(
+    uri: &str,
+    policy: &PolicySnapshot,
+    options: &SingboxOptions,
+    config_path: &std::path::Path,
+    meta_path: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    let parsed = parse_share_uri(uri).map_err(|e| e.to_string())?;
+    let cfg = build_singbox_config_with_options(&parsed, policy, options)?;
+    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    write_private_atomic(config_path, &text)?;
+
+    if let Some(meta) = meta_path {
+        let redacted = redact_singbox_config(&cfg);
+        let meta_text = serde_json::to_string_pretty(&redacted).map_err(|e| e.to_string())?;
+        write_private_atomic(meta, &meta_text)?;
+    }
+    Ok(config_path.to_path_buf())
+}
+
+fn write_private_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create config dir: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, text).map_err(|e| format!("write singbox config: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod singbox config: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("install singbox config: {e}")
+    })
+}
+
 /// Write sing-box config to an **ephemeral** runtime file (0600).
 /// Credentials never persist in `singbox-run.json`.
 /// A redacted meta file is written for diagnostics.
@@ -263,23 +473,26 @@ pub fn write_singbox_config_with_policy(
     uri: &str,
     policy: &PolicySnapshot,
 ) -> Result<std::path::PathBuf, String> {
-    let parsed = parse_share_uri(uri).map_err(|e| e.to_string())?;
-    let cfg = build_singbox_config_from_parsed(&parsed, policy)?;
+    write_legacy_singbox_config(uri, policy, &SingboxOptions::default())
+}
+
+/// Write the legacy/default-instance ephemeral config with explicit options.
+///
+/// Keeps `runtime/active.path` and scrubs the historical plaintext
+/// `singbox-run.json`, while supporting a non-default Clash API port.
+pub fn write_legacy_singbox_config(
+    uri: &str,
+    policy: &PolicySnapshot,
+    options: &SingboxOptions,
+) -> Result<std::path::PathBuf, String> {
     let path = crate::config_paths::ephemeral_singbox_path()?;
-    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &text).map_err(|e| format!("write ephemeral singbox config: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    let meta = crate::config_paths::singbox_meta_path()?;
+    write_singbox_config_at(uri, policy, options, &path, Some(&meta))?;
+
     // Pointer for cleanup / reload
     let ptr = crate::config_paths::ephemeral_pointer_path()?;
     std::fs::write(&ptr, path.to_string_lossy().as_bytes())
         .map_err(|e| format!("write ephemeral pointer: {e}"))?;
-
-    // Redacted meta for diagnostics (no uuid/password)
-    write_redacted_meta(&cfg)?;
 
     // Scrub legacy persistent credential file if present
     scrub_legacy_singbox_run()?;
@@ -299,24 +512,85 @@ pub fn redact_singbox_config(cfg: &Value) -> Value {
                 ob["password"] = json!("********");
             }
             if ob.get("alter_id").is_some() {
-                // keep alter_id (not a secret) 
+                // keep alter_id (not a secret)
             }
         }
     }
     out
 }
 
-fn write_redacted_meta(cfg: &Value) -> Result<(), String> {
-    let meta = redact_singbox_config(cfg);
-    let path = crate::config_paths::singbox_meta_path()?;
-    let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| format!("write singbox meta: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+/// Redact share-URI credentials and JSON secret fields from arbitrary log text.
+///
+/// sing-box warn/error logs normally contain no credentials, but a malformed
+/// URI or an operator-supplied error can. Runtime log/diagnostic endpoints run
+/// through this function before returning text to the UI.
+pub fn redact_log_text(text: &str) -> String {
+    let scrubbed = redact_json_secret_fields(text);
+    let mut out = String::with_capacity(scrubbed.len());
+    for token in scrubbed.split_inclusive(|c: char| c.is_whitespace()) {
+        let trimmed = token.trim_end_matches(|c: char| c.is_whitespace());
+        let suffix = &token[trimmed.len()..];
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("vless://")
+            || lower.starts_with("vmess://")
+            || lower.starts_with("trojan://")
+            || lower.starts_with("ss://")
+        {
+            out.push_str("***redacted-uri***");
+        } else if looks_like_uuid(trimmed.trim_matches(|c: char| c == '"' || c == ',' || c == '\''))
+        {
+            out.push_str("********");
+        } else {
+            out.push_str(trimmed);
+        }
+        out.push_str(suffix);
     }
-    Ok(())
+    out
+}
+
+fn redact_json_secret_fields(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let next = ["\"uuid\"", "\"password\""]
+            .iter()
+            .filter_map(|key| lower.find(key).map(|idx| (idx, *key)))
+            .min_by_key(|(idx, _)| *idx);
+        let Some((idx, key)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        let after_key = idx + key.len();
+        out.push_str(&rest[..after_key]);
+        let tail = &rest[after_key..];
+        let Some(colon) = tail.find(':') else {
+            out.push_str(tail);
+            break;
+        };
+        out.push_str(&tail[..=colon]);
+        let value_part = &tail[colon + 1..];
+        let trimmed = value_part.trim_start();
+        if let Some(inner) = trimmed.strip_prefix('"') {
+            if let Some(end) = inner.find('"') {
+                out.push_str(&value_part[..value_part.len() - trimmed.len()]);
+                out.push_str("\"********\"");
+                rest = &inner[end + 1..];
+                continue;
+            }
+        }
+        rest = value_part;
+    }
+    out
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(p, len)| p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn scrub_legacy_singbox_run() -> Result<(), String> {
@@ -357,8 +631,7 @@ fn has_raw_uuid_or_password(text: &str) -> bool {
         let rest = &text[idx..];
         if let Some(q1) = rest.find(':') {
             let after = rest[q1 + 1..].trim_start();
-            if after.starts_with('"') {
-                let after = &after[1..];
+            if let Some(after) = after.strip_prefix('"') {
                 if let Some(end) = after.find('"') {
                     let val = &after[..end];
                     if val != "********" && val.len() >= 8 {
@@ -486,9 +759,7 @@ mod tests {
             rules.iter().any(|r| {
                 r.get("ip_cidr")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|arr| {
-                        arr.iter().any(|v| v.as_str() == Some("127.0.0.0/8"))
-                    })
+                    .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("127.0.0.0/8")))
                     && r["outbound"] == "direct"
             }),
             "expected local exclusion CIDRs after private rule"
@@ -529,7 +800,8 @@ mod tests {
         assert!(!legacy.is_file(), "legacy singbox-run.json must not exist");
         assert!(!persistent_config_has_secrets().unwrap());
 
-        let meta = std::fs::read_to_string(crate::config_paths::singbox_meta_path().unwrap()).unwrap();
+        let meta =
+            std::fs::read_to_string(crate::config_paths::singbox_meta_path().unwrap()).unwrap();
         assert!(meta.contains("********"));
         assert!(!meta.contains("11111111-1111-1111-1111-111111111111"));
 

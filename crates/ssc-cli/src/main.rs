@@ -28,13 +28,9 @@ enum Commands {
     /// List saved profiles
     List,
     /// Set active profile by id or name
-    Use {
-        id: String,
-    },
+    Use { id: String },
     /// Remove a profile by id or name
-    Remove {
-        id: String,
-    },
+    Remove { id: String },
     /// Probe all profiles; print ranked latency table
     Race {
         /// Set active profile to the fastest reachable
@@ -64,6 +60,15 @@ enum Commands {
         /// Profile id/name (default: active)
         #[arg(long)]
         id: Option<String>,
+        /// Start this pre-configured independent instance instead of `default`
+        #[arg(long)]
+        instance: Option<String>,
+        /// Connection mode: `tun` (system VPN) or `proxy` (local HTTP/SOCKS)
+        #[arg(long)]
+        mode: Option<String>,
+        /// Local proxy port (with `--mode proxy`; default: allocate safely)
+        #[arg(long)]
+        proxy_port: Option<u16>,
         /// Pick lowest-latency reachable profile and keep failover watch
         #[arg(long)]
         best: bool,
@@ -92,9 +97,7 @@ enum Commands {
         port: u16,
     },
     /// Set routing mode: selective | full
-    Mode {
-        mode: String,
-    },
+    Mode { mode: String },
     /// Policy rules
     #[command(subcommand)]
     Rules(RulesCmd),
@@ -140,6 +143,9 @@ enum Commands {
         #[command(subcommand)]
         action: Option<PrivilegesCmd>,
     },
+    /// Independent, concurrently running VPN instances (TUN or Local Proxy)
+    #[command(subcommand)]
+    Instance(InstanceCmd),
     /// Internal: run sing-box as elevated worker (do not call manually)
     #[command(name = "__tunnel-worker", hide = true)]
     TunnelWorker {
@@ -149,6 +155,70 @@ enum Commands {
         singbox: PathBuf,
         #[arg(long)]
         profile_id: Option<String>,
+        #[arg(long)]
+        instance_id: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        proxy_port: Option<u16>,
+        #[arg(long)]
+        clash_port: Option<u16>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InstanceCmd {
+    /// Create an independent instance (does not start it)
+    Add {
+        /// Instance id (default: derived from name)
+        #[arg(long)]
+        id: Option<String>,
+        /// Human-readable name
+        #[arg(long)]
+        name: Option<String>,
+        /// Profile id/name (default: active profile at start)
+        #[arg(long)]
+        profile: Option<String>,
+        /// `proxy` (default, no root) or `tun` (system VPN)
+        #[arg(long, default_value = "proxy")]
+        mode: String,
+        /// Proxy inbound: mixed | http | socks
+        #[arg(long, default_value = "mixed")]
+        proxy_kind: String,
+        /// Explicit local proxy port (default: allocated from policy range)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Explicit Clash/admin port (default: allocated)
+        #[arg(long)]
+        clash_port: Option<u16>,
+        /// Start immediately after creating
+        #[arg(long)]
+        start: bool,
+    },
+    /// List instances and their state
+    List,
+    /// Show one instance
+    Show { id: String },
+    /// Start one instance (others are untouched)
+    Start { id: String },
+    /// Stop one instance (others keep running)
+    Stop { id: String },
+    /// Restart one instance
+    Restart { id: String },
+    /// Remove an instance definition and its runtime files
+    Remove { id: String },
+    /// Tail an instance log (redacted)
+    Logs {
+        id: String,
+        #[arg(long, default_value_t = 16 * 1024)]
+        max_bytes: usize,
+    },
+    /// Show or replace an instance's isolated policy
+    Policy {
+        id: String,
+        /// Set routing mode: selective | full
+        #[arg(long)]
+        mode: Option<String>,
     },
 }
 
@@ -173,9 +243,7 @@ enum RulesCmd {
         action: String,
     },
     /// Remove by id or match value
-    Remove {
-        id: String,
-    },
+    Remove { id: String },
 }
 
 fn main() {
@@ -192,6 +260,21 @@ fn ensure_singbox() -> Result<(), String> {
         ssc_runtime::run_setup()?;
     }
     Ok(())
+}
+
+fn print_instance(v: &ssc_service::InstanceStatusView) {
+    println!(
+        "id={} state={} mode={} kind={} endpoint={} pid={}",
+        v.id,
+        v.state.as_str(),
+        v.mode,
+        v.proxy_kind,
+        v.endpoint.as_deref().unwrap_or("-"),
+        v.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+    );
+    if let Some(err) = &v.last_error {
+        eprintln!("last_error={err}");
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -258,10 +341,7 @@ fn run() -> Result<(), String> {
             ssc_core::remove_profile(&id)?;
             println!("removed {id}");
         }
-        Commands::Race {
-            use_best,
-            timeout,
-        } => {
+        Commands::Race { use_best, timeout } => {
             let file = ssc_core::list_profiles()?;
             if file.profiles.is_empty() {
                 return Err("no profiles — run `ssc add` first".into());
@@ -276,11 +356,7 @@ fn run() -> Result<(), String> {
                 let best = ssc_runtime::pick_best(&results)
                     .ok_or_else(|| "no reachable profiles".to_string())?;
                 ssc_core::set_active(&best.profile_id)?;
-                println!(
-                    "active={} ({} ms)",
-                    best.name,
-                    best.latency_ms.unwrap_or(0)
-                );
+                println!("active={} ({} ms)", best.name, best.latency_ms.unwrap_or(0));
             } else if let Some(best) = ssc_runtime::pick_best(&results) {
                 println!(
                     "winner={} ({} ms) — pass --use-best to set active",
@@ -319,11 +395,12 @@ fn run() -> Result<(), String> {
                 Duration::from_secs(timeout),
                 Duration::from_secs(interval),
             )?;
-            let loss = if stats.sent == 0 {
-                0
-            } else {
-                100 * (stats.sent - stats.received) / stats.sent
-            };
+            let loss = stats
+                .sent
+                .checked_sub(stats.received)
+                .and_then(|d| d.checked_mul(100))
+                .and_then(|n| n.checked_div(stats.sent))
+                .unwrap_or(0);
             println!("--- {} ping statistics ---", stats.name);
             println!(
                 "{} packets transmitted, {} received, {}% packet loss",
@@ -342,6 +419,9 @@ fn run() -> Result<(), String> {
         }
         Commands::Connect {
             id,
+            instance,
+            mode,
+            proxy_port,
             best,
             once,
             interval,
@@ -350,8 +430,8 @@ fn run() -> Result<(), String> {
         } => {
             ensure_singbox()?;
             if best {
-                if id.is_some() {
-                    return Err("use either --best or --id, not both".into());
+                if id.is_some() || instance.is_some() || mode.is_some() {
+                    return Err("use --best alone (not with --id, --instance or --mode)".into());
                 }
                 let opts = ssc_runtime::BestConnectOptions {
                     race: ssc_runtime::RaceOptions {
@@ -367,16 +447,40 @@ fn run() -> Result<(), String> {
                 if once {
                     println!("{}", ssc_runtime::status_summary());
                 }
+            } else if let Some(instance) = instance {
+                let manager = ssc_service::VpnManager::global().instances();
+                let view = ssc_service::run_blocking(manager.start(&instance))?;
+                print_instance(&view);
             } else {
                 if let Some(id) = id {
                     ssc_core::set_active(&id)?;
                 }
-                let status = ssc_service::VpnManager::global().connect()?;
+                let selected = match mode.as_deref() {
+                    None | Some("tun") | Some("system") => None,
+                    Some("proxy") | Some("local") => Some(ssc_service::InstanceMode::Proxy),
+                    Some(other) => {
+                        return Err(format!("invalid mode: {other} (tun|proxy)"));
+                    }
+                };
+                let status = match selected {
+                    Some(ssc_service::InstanceMode::Proxy) => {
+                        ssc_service::VpnManager::global().connect_proxy(proxy_port)?
+                    }
+                    _ => ssc_service::VpnManager::global().connect()?,
+                };
                 println!(
-                    "state={} server={} interface={}",
+                    "state={} mode={} server={} interface={} endpoint={}",
                     status.state.as_str(),
+                    status.mode,
                     status.server.as_deref().unwrap_or("-"),
-                    status.interface.as_deref().unwrap_or("-")
+                    status.interface.as_deref().unwrap_or("-"),
+                    if selected.is_some() {
+                        proxy_port
+                            .map(|p| format!("http://127.0.0.1:{p}"))
+                            .unwrap_or_else(|| "allocated".into())
+                    } else {
+                        "-".into()
+                    }
                 );
             }
         }
@@ -399,10 +503,7 @@ fn run() -> Result<(), String> {
             println!("mode={}", status.mode);
             println!("server={}", status.server.as_deref().unwrap_or("-"));
             println!("interface={}", status.interface.as_deref().unwrap_or("-"));
-            println!(
-                "profile={}",
-                status.profile_name.as_deref().unwrap_or("-")
-            );
+            println!("profile={}", status.profile_name.as_deref().unwrap_or("-"));
             println!("bytes_sent={}", status.bytes_sent);
             println!("bytes_received={}", status.bytes_received);
             if let Some(e) = status.last_error {
@@ -453,7 +554,12 @@ fn run() -> Result<(), String> {
                 let a = ssc_policy::Action::parse(&action)
                     .ok_or_else(|| format!("invalid action: {action}"))?;
                 let rule = ssc_policy::add_rule(k, &value, a).map_err(|e| e.to_string())?;
-                println!("added {} {} → {}", rule.kind.as_str(), rule.value, rule.action.as_str());
+                println!(
+                    "added {} {} → {}",
+                    rule.kind.as_str(),
+                    rule.value,
+                    rule.action.as_str()
+                );
                 let _ = ssc_service::VpnManager::global().apply_policy();
             }
             RulesCmd::Remove { id } => {
@@ -488,16 +594,10 @@ fn run() -> Result<(), String> {
                 println!("destination={}", result.destination);
                 println!("action={}", result.action);
                 println!("mode={}", result.policy_mode);
-                println!(
-                    "interface={}",
-                    result.interface.as_deref().unwrap_or("-")
-                );
+                println!("interface={}", result.interface.as_deref().unwrap_or("-"));
                 println!("ips={}", result.resolved_ips.join(","));
                 if let Some(r) = &result.matched_rule {
-                    println!(
-                        "matched={} {} {} → {}",
-                        r.id, r.kind, r.value, r.action
-                    );
+                    println!("matched={} {} {} → {}", r.id, r.kind, r.value, r.action);
                 } else {
                     println!("matched=(default)");
                 }
@@ -543,10 +643,7 @@ fn run() -> Result<(), String> {
             match action {
                 PrivilegesCmd::Status => {
                     println!("{}", ssc_runtime::privileges_status());
-                    println!(
-                        "passwordless={}",
-                        ssc_runtime::passwordless_tunnel_ok()
-                    );
+                    println!("passwordless={}", ssc_runtime::passwordless_tunnel_ok());
                 }
                 PrivilegesCmd::Install => {
                     let path = ssc_runtime::install_privileges()?;
@@ -558,12 +655,127 @@ fn run() -> Result<(), String> {
                 }
             }
         }
+        Commands::Instance(cmd) => {
+            let manager = ssc_service::VpnManager::global().instances();
+            match cmd {
+                InstanceCmd::Add {
+                    id,
+                    name,
+                    profile,
+                    mode,
+                    proxy_kind,
+                    port,
+                    clash_port,
+                    start,
+                } => {
+                    let req = ssc_service::CreateInstanceRequest {
+                        id,
+                        name,
+                        profile_id: profile,
+                        mode: Some(mode),
+                        proxy_kind: Some(proxy_kind),
+                        listen_port: port,
+                        clash_api_port: clash_port,
+                        start_on_boot: None,
+                        ..Default::default()
+                    };
+                    let view = ssc_service::run_blocking(manager.create(req))?;
+                    print_instance(&view);
+                    if start {
+                        let view = ssc_service::run_blocking(manager.start(&view.id))?;
+                        print_instance(&view);
+                    }
+                }
+                InstanceCmd::List => {
+                    let views = ssc_service::run_blocking(manager.list())?;
+                    if views.is_empty() {
+                        println!("(no instances)");
+                    }
+                    for v in views {
+                        println!(
+                            "{:<20} {:<13} {:<7} {:<6} {}",
+                            v.id,
+                            v.state.as_str(),
+                            v.mode,
+                            v.proxy_kind,
+                            v.endpoint.as_deref().unwrap_or("-")
+                        );
+                    }
+                }
+                InstanceCmd::Show { id } => {
+                    let view = ssc_service::run_blocking(manager.status(&id))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&view).unwrap_or_default()
+                    );
+                }
+                InstanceCmd::Start { id } => {
+                    let view = ssc_service::run_blocking(manager.start(&id))?;
+                    print_instance(&view);
+                }
+                InstanceCmd::Stop { id } => {
+                    let view = ssc_service::run_blocking(manager.stop(&id))?;
+                    print_instance(&view);
+                }
+                InstanceCmd::Restart { id } => {
+                    let view = ssc_service::run_blocking(manager.restart(&id))?;
+                    print_instance(&view);
+                }
+                InstanceCmd::Remove { id } => {
+                    ssc_service::run_blocking(manager.remove(&id))?;
+                    println!("removed {id}");
+                }
+                InstanceCmd::Logs { id, max_bytes } => {
+                    let text = ssc_service::run_blocking(manager.log_tail(&id, max_bytes))?;
+                    print!("{text}");
+                    if !text.ends_with('\n') {
+                        println!();
+                    }
+                }
+                InstanceCmd::Policy { id, mode } => match mode {
+                    Some(mode) => {
+                        let parsed = ssc_policy::PolicyMode::parse(&mode)
+                            .ok_or_else(|| format!("invalid mode: {mode} (selective|full)"))?;
+                        let mut policy = ssc_service::run_blocking(manager.policy(&id))?;
+                        policy.settings.mode = parsed;
+                        let view = ssc_service::run_blocking(manager.set_policy(&id, &policy))?;
+                        println!("instance={id} mode={}", view.policy_mode);
+                    }
+                    None => {
+                        let policy = ssc_service::run_blocking(manager.policy(&id))?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&policy).unwrap_or_default()
+                        );
+                    }
+                },
+            }
+        }
         Commands::TunnelWorker {
             config,
             singbox,
             profile_id,
+            instance_id,
+            mode,
+            proxy_port,
+            clash_port,
         } => {
-            ssc_runtime::run_tunnel_worker(&config, &singbox, profile_id.as_deref())?;
+            let mode = match mode.as_deref() {
+                Some(m) => Some(
+                    ssc_service::InstanceMode::parse(m)
+                        .ok_or_else(|| format!("invalid worker mode: {m}"))?,
+                ),
+                None => None,
+            };
+            ssc_runtime::run_instance_worker(
+                &config,
+                &singbox,
+                profile_id.as_deref(),
+                instance_id.as_deref(),
+                mode,
+                proxy_port,
+                clash_port,
+            )?;
         }
     }
     Ok(())

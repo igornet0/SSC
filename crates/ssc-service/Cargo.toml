@@ -14,7 +14,12 @@ ssc-core = { workspace = true }
 ssc-policy = { workspace = true }
 ssc-runtime = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

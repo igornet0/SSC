@@ -176,6 +176,41 @@ pub struct Settings {
     /// After the gateway starts, connect the active profile automatically.
     #[serde(default)]
     pub connect_automatically: bool,
+    /// First port considered when allocating Local Proxy inbounds.
+    #[serde(default = "default_proxy_port_start")]
+    pub proxy_port_start: u16,
+    /// Last port considered when allocating Local Proxy inbounds.
+    #[serde(default = "default_proxy_port_end")]
+    pub proxy_port_end: u16,
+    /// First port considered when allocating per-instance Clash/admin APIs.
+    #[serde(default = "default_clash_port_start")]
+    pub clash_port_start: u16,
+    /// Last port considered when allocating per-instance Clash/admin APIs.
+    #[serde(default = "default_clash_port_end")]
+    pub clash_port_end: u16,
+    /// Seconds between instance health checks.
+    #[serde(default = "default_health_interval_s")]
+    pub health_check_interval_s: u64,
+}
+
+fn default_proxy_port_start() -> u16 {
+    19_000
+}
+
+fn default_proxy_port_end() -> u16 {
+    19_999
+}
+
+fn default_clash_port_start() -> u16 {
+    9_091
+}
+
+fn default_clash_port_end() -> u16 {
+    9_199
+}
+
+fn default_health_interval_s() -> u64 {
+    2
 }
 
 fn default_mode() -> PolicyMode {
@@ -205,6 +240,11 @@ impl Default for Settings {
             api_port: default_api_port(),
             launch_at_login: false,
             connect_automatically: false,
+            proxy_port_start: default_proxy_port_start(),
+            proxy_port_end: default_proxy_port_end(),
+            clash_port_start: default_clash_port_start(),
+            clash_port_end: default_clash_port_end(),
+            health_check_interval_s: default_health_interval_s(),
         }
     }
 }

@@ -88,8 +88,7 @@ pub fn load_secret(account: &str) -> Result<String, String> {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(
-                            "keychain load timed out (unlock Keychain / allow SSC access)"
-                                .into(),
+                            "keychain load timed out (unlock Keychain / allow SSC access)".into(),
                         );
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -119,7 +118,7 @@ pub fn normalize_keychain_secret(raw: &str) -> String {
         return trimmed.to_string();
     }
     if trimmed.len() >= 16
-        && trimmed.len() % 2 == 0
+        && trimmed.len().is_multiple_of(2)
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
     {
         if let Ok(bytes) = decode_hex(trimmed) {
@@ -165,13 +164,7 @@ pub fn delete_secret(account: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let _ = Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                SERVICE,
-                "-a",
-                account,
-            ])
+            .args(["delete-generic-password", "-s", SERVICE, "-a", account])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();

@@ -45,10 +45,11 @@ impl PolicyEngine {
         if let Some(domain) = dest.domain.as_deref() {
             let host = normalize_domain(domain);
             for r in self.enabled_rules() {
-                if r.kind == MatchKind::Domain && is_exact_domain(&r.value) {
-                    if normalize_domain(&r.value) == host {
-                        return Some(r);
-                    }
+                if r.kind == MatchKind::Domain
+                    && is_exact_domain(&r.value)
+                    && normalize_domain(&r.value) == host
+                {
+                    return Some(r);
                 }
             }
             // 2. Domain wildcard — longest suffix wins
@@ -118,9 +119,7 @@ impl PolicyEngine {
 }
 
 fn normalize_domain(d: &str) -> String {
-    d.trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
+    d.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn is_exact_domain(value: &str) -> bool {
@@ -163,10 +162,17 @@ mod tests {
     fn exact_domain() {
         let e = engine(
             PolicyMode::Selective,
-            vec![PolicyRule::new(MatchKind::Domain, "google.com", Action::Vpn)],
+            vec![PolicyRule::new(
+                MatchKind::Domain,
+                "google.com",
+                Action::Vpn,
+            )],
         );
         assert_eq!(e.decide(&RuleMatch::domain("google.com")), Action::Vpn);
-        assert_eq!(e.decide(&RuleMatch::domain("www.google.com")), Action::Direct);
+        assert_eq!(
+            e.decide(&RuleMatch::domain("www.google.com")),
+            Action::Direct
+        );
     }
 
     #[test]
@@ -275,7 +281,11 @@ mod tests {
     fn decide_with_rule_returns_match() {
         let e = engine(
             PolicyMode::Selective,
-            vec![PolicyRule::new(MatchKind::Domain, "google.com", Action::Vpn)],
+            vec![PolicyRule::new(
+                MatchKind::Domain,
+                "google.com",
+                Action::Vpn,
+            )],
         );
         let (action, rule) = e.decide_with_rule(&RuleMatch::domain("google.com"));
         assert_eq!(action, Action::Vpn);

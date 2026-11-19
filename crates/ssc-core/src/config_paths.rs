@@ -12,11 +12,7 @@ pub fn config_dir() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        return dirs::home_dir().map(|h| {
-            h.join("Library")
-                .join("Application Support")
-                .join("ssc")
-        });
+        dirs::home_dir().map(|h| h.join("Library").join("Application Support").join("ssc"))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -47,6 +43,60 @@ pub fn singbox_meta_path() -> Result<PathBuf, String> {
 pub fn runtime_dir() -> Result<PathBuf, String> {
     let dir = ensure_config_dir()?.join("runtime");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create runtime dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Root directory containing one subdirectory per named VPN instance.
+pub fn instances_dir() -> Result<PathBuf, String> {
+    let dir = ensure_config_dir()?.join("instances");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create instances dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
+/// Registry metadata for named instances (`instances.json`, no credentials).
+pub fn instances_registry_path() -> Result<PathBuf, String> {
+    Ok(ensure_config_dir()?.join("instances.json"))
+}
+
+/// Validate an instance id used as a directory name.
+///
+/// Only `[A-Za-z0-9._-]` is accepted, no path separators, no `..` and no
+/// leading dot. This prevents path traversal and hidden runtime directories.
+pub fn validate_instance_id(id: &str) -> Result<(), String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("instance id empty".into());
+    }
+    if id.len() > 64 {
+        return Err("instance id too long (max 64)".into());
+    }
+    if id.starts_with('.') || id.contains("..") {
+        return Err("instance id must not start with '.' or contain '..'".into());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err("instance id may only contain letters, digits, '-', '_' and '.'".into());
+    }
+    Ok(())
+}
+
+/// Per-instance directory (`instances/{id}`), created with mode 0700.
+pub fn instance_dir(id: &str) -> Result<PathBuf, String> {
+    validate_instance_id(id)?;
+    let dir = instances_dir()?.join(id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create instance dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     Ok(dir)
 }
 
