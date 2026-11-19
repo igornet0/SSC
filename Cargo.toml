@@ -24,6 +24,13 @@ license = "MIT"
 repository = "https://github.com/igornet0/SSC"
 authors = ["SSC"]
 
+[dependencies]
+ssc-core = { workspace = true }
+ssc-runtime = { workspace = true }
+ssc-policy = { workspace = true }
+ssc-service = { workspace = true }
+ssc-api = { workspace = true }
+
 [workspace.dependencies]
 ssc-core = { path = "crates/ssc-core" }
 ssc-runtime = { path = "crates/ssc-runtime" }
